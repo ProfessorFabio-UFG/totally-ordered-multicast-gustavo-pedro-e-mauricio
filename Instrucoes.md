@@ -1,5 +1,6 @@
 cada processo vai ter um relógio logico (temos que implementar o relógio logico nos pares e ele tem que atualizar ao receber dados)
 acrescentar time stemp nas mensagens
+
 acrescentar mensagens de ack da aplicação ( vai com time stemp também )
 
 um par ao receber uma mensagem:
@@ -15,3 +16,6 @@ comparisonServer	-  só rodar
 peerCommunicatorUDP.py	-  é o que temos que fazer a mudança no código
 
 ( não usar sleep )
+
+
+objetivo: não ter mensagens desordenadas
