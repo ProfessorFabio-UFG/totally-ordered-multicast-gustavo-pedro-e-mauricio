@@ -1,6 +1,6 @@
 PEER_UDP_PORT = 6789
 PEER_TCP_PORT = 5679
-N = 4   # Number of peers
+N = 2   # Number of peers
 SERVER_ADDR ='98.82.5.138'
 SERVER_PORT = 5678
 GROUPMNGR_ADDR = '34.201.57.169'

@@ -9,9 +9,9 @@ import heapq
 handShakeCount = 0
 PEERS = []
 logical_clock = 0
-message_queue = [] # Min-heap to store messages based on their timestamp
-expected_acks = {} # Dictionary to keep track of acks for sent messages
-received_acks = {} # Dictionary to store received acks for sent messages
+message_queue = [] # Min-heap para armazenar mensagens com base no seu timestamp
+expected_acks = {} # Dicionário para rastrear os ACKs para mensagens enviadas
+received_acks = {} # Dicionário para armazenar os ACKs recebidos para mensagens enviadas
 messages_to_process = threading.Event()
 myself = -1
 nMsgs = -1
@@ -72,20 +72,23 @@ class MsgHandler(threading.Thread):
     global logical_clock
     global myself
 
-    while handShakeCount < N:
+    while handShakeCount < N - 1: # Aguarda handshakes de N-1 outros pares
       msgPack = self.sock.recv(1024)
-      msg_type, sender_id, msg_timestamp, _ = pickle.loads(msgPack)
+      # Desempacota a mensagem, esperando o ID numérico do remetente e o endereço IP
+      msg_type, sender_numerical_id, msg_timestamp, sender_ip_address = pickle.loads(msgPack)
       update_logical_clock(msg_timestamp)
 
       if msg_type == 'READY':
         handShakeCount += 1
-        print('--- Handshake recebido: ', sender_id, ' Clock:', logical_clock)
-        # Send handshake ACK
-        ack_msg = ('ACK_READY', myself, logical_clock, sender_id)
-        sendSocket.sendto(pickle.dumps(ack_msg), (sender_id, PEER_UDP_PORT))
+        print(f'--- Handshake recebido de ID: {sender_numerical_id}, IP: {sender_ip_address}, Clock: {logical_clock}')
+        # Envia ACK de handshake de volta para o endereço IP do remetente
+        ack_msg = ('ACK_READY', myself, logical_clock, sender_numerical_id) # Conteúdo é o ID numérico do peer cujo handshake está sendo ACKado
+        sendSocket.sendto(pickle.dumps(ack_msg), (sender_ip_address, PEER_UDP_PORT))
       elif msg_type == 'ACK_READY':
-        # This ACK means a handshake sent by me was acknowledged
-        print(f"--- ACK_READY recebido de {sender_id}. Meu clock: {logical_clock}")
+        # Este ACK significa que um handshake enviado por mim foi reconhecido
+        # O 'content' de ACK_READY é o ID numérico do peer que enviou o READY original
+        acked_peer_numerical_id = sender_numerical_id # O 'sender_id' do ACK é o 'myself' do peer que ACKou
+        print(f"--- ACK_READY recebido de {sender_numerical_id}. Meu clock: {logical_clock}")
 
     print('Thread Secundária: Recebeu todos os handshakes. Entrando no loop para receber mensagens.')
 
@@ -109,33 +112,50 @@ class MsgHandler(threading.Thread):
           print(f"Mensagem DATA {content} de {sender_id} (clock: {msg_timestamp}) enfileirada. Meu clock: {logical_clock}")
           # 3. Enviar ACK
           ack_msg = ('ACK', myself, logical_clock, (sender_id, content)) # ACK para a mensagem específica
-          sendSocket.sendto(pickle.dumps(ack_msg), (sender_id, PEER_UDP_PORT))
+          # Para enviar o ACK, precisamos do IP do remetente original. Assumimos que PEERS lista de IPs
+          # Para simplificar, o peer que enviou a mensagem de dados (sender_id) é um ID numérico.
+          # O sistema atual não tem um mapeamento direto de sender_id para IP aqui.
+          # No entanto, como o ACK_READY já está enviando para o IP, vamos assumir que para DATA,
+          # o 'sender_id' na mensagem DATA é o IP. Se 'sender_id' for o ID numérico, teremos um problema similar.
+          # Pela estrutura atual, 'sender_id' de DATA é o ID numérico do peer.
+          # PRECISAMOS SABER O IP DO REMETENTE DA MENSAGEM DATA PARA ENVIAR O ACK!
+          # Para resolver isso, a mensagem DATA também deveria conter o IP do remetente.
+          # Por agora, vamos usar PEERS[sender_id] se os IDs numéricos corresponderem aos índices da lista PEERS.
+          # Se não, precisaríamos de um mapeamento explícito ou de outra estrutura.
+
+          # ASSUMIMOS AQUI QUE PEERS É UMA LISTA DE IPS E QUE O ID NUMÉRICO DO REMETENTE (sender_id)
+          # PODE SER USADO COMO ÍNDICE PARA OBTER SEU IP. ISSO PODE NÃO SER GARANTIDO NO CENÁRIO REAL.
+          # Uma solução mais robusta seria a mensagem DATA conter o IP de origem.
+          if sender_id < len(PEERS): # Se sender_id é um ID numérico que corresponde a um índice na lista PEERS
+              sendSocket.sendto(pickle.dumps(ack_msg), (PEERS[sender_id], PEER_UDP_PORT))
+          else: # Se sender_id não é um ID numérico, ou não corresponde a um índice
+              print(f"Erro: Não foi possível enviar ACK para {sender_id}. IP do remetente de DATA não encontrado.")
+
         elif msg_type == 'ACK':
           # 1. Atualiza o relógio lógico (já feito acima)
           # 2. Coloca a mensagem na fila (ACKs não precisam de ACKs, mas registramos)
           original_sender, original_content = content
-          if (original_sender, original_content) in received_acks:
-            received_acks[(original_sender, original_content)].add(sender_id)
-            print(f"ACK para DATA {original_content} de {original_sender} recebido de {sender_id}. Meu clock: {logical_clock}")
-            messages_to_process.set() # Sinaliza que pode haver mensagens para processar
-          else:
-            print(f"ACK para mensagem desconhecida ({original_sender}, {original_content}) de {sender_id}. Meu clock: {logical_clock}")
+          if (original_sender, original_content) not in received_acks:
+              received_acks[(original_sender, original_content)] = set()
+          received_acks[(original_sender, original_content)].add(sender_id)
+          print(f"ACK para DATA {original_content} de {original_sender} recebido de {sender_id}. Meu clock: {logical_clock}")
+          messages_to_process.set() # Sinaliza que pode haver mensagens para processar
 
       except BlockingIOError:
-        pass # No data available, continue loop
+        pass # Nenhum dado disponível, continua o loop
       except Exception as e:
         print(f"Erro ao receber mensagem: {e}")
     
-    # Process remaining messages in queue before finishing
+    # Processa as mensagens restantes na fila antes de finalizar
     while message_queue:
       self.process_next_message()
 
-    # Write log file
+    # Escreve o arquivo de log
     logFile = open('logfile'+str(myself)+'.log', 'w')
     logFile.writelines(str(self.logList))
     logFile.close()
     
-    # Send the list of messages to the server (using a TCP socket) for comparison
+    # Envia a lista de mensagens para o servidor (usando um socket TCP) para comparação
     print('Enviando a lista de mensagens para o servidor para comparação...')
     clientSock = socket(AF_INET, SOCK_STREAM)
     clientSock.connect((SERVER_ADDR, SERVER_PORT))
@@ -156,31 +176,30 @@ class MsgHandler(threading.Thread):
       next_msg_timestamp, next_msg_sender, next_msg_content = heapq.nsmallest(1, message_queue)[0]
       message_id = (next_msg_sender, next_msg_content)
 
-      # Check if all expected ACKs for this message have been received
+      # Verifica se todos os ACKs esperados para esta mensagem foram recebidos
       if message_id in expected_acks:
         if expected_acks[message_id].issubset(received_acks.get(message_id, set())):
-          # Message is ready to be delivered
+          # Mensagem pronta para ser entregue
           timestamp, sender, content = heapq.heappop(message_queue)
           print(f'Mensagem {content} de processo {sender} (clock: {timestamp}) entregue à aplicação. Meu clock: {logical_clock}')
           self.logList.append((sender, content, timestamp))
-          # Clear ACKs related to this message
+          # Limpa os ACKs relacionados a esta mensagem
           if message_id in expected_acks:
             del expected_acks[message_id]
           if message_id in received_acks:
             del received_acks[message_id]
         else:
-          # Not all ACKs received, wait
+          # Nem todos os ACKs recebidos, espera
           return
       else:
-        # If no expected_acks entry, it means it's an ACK or a message sent by myself
-        # (which doesn't require ACKs from others)
-        # This part might need refinement based on exact message types and processing logic
+        # Se não houver entrada em expected_acks, significa que é um ACK ou uma mensagem enviada por mim mesmo
+        # (que não requer ACKs de outros)
         timestamp, sender, content = heapq.heappop(message_queue)
         print(f'Mensagem {content} de processo {sender} (clock: {timestamp}) entregue à aplicação (sem ACK esperado). Meu clock: {logical_clock}')
         self.logList.append((sender, content, timestamp))
 
 
-# Function to wait for start signal from comparison server:
+# Função para aguardar o sinal de início do servidor de comparação:
 def waitToStart():
   global myself, nMsgs
   (conn, addr) = serverSock.accept()
@@ -202,66 +221,67 @@ while True:
     print('Finalizando.')
     break
 
-  # Create receiving message handler
+  # Cria o manipulador de mensagens de recebimento
   msgHandler = MsgHandler(recvSocket)
   msgHandler.start()
   print('Manipulador iniciado')
 
   PEERS = getListOfPeers()
+  my_ip_address = get_public_ip()
   
-  # Send handshakes and wait for ACKs
+  # Envia handshakes e aguarda ACKs
   for addrToSend in PEERS:
-    if addrToSend != get_public_ip(): # Don't send handshake to myself
+    if addrToSend != my_ip_address: # Não envia handshake para si mesmo
       update_logical_clock()
-      msg = ('READY', myself, logical_clock, None)
+      # Inclui o endereço IP do remetente na mensagem READY
+      msg = ('READY', myself, logical_clock, my_ip_address)
       msgPack = pickle.dumps(msg)
       sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
 
-  # Wait for all handshakes to be received (including their ACKs)
-  # The MsgHandler handles the handShakeCount, so main thread just waits for it to reach N
-  while (handShakeCount < N -1): # -1 because I don't handshake myself
+  # Aguarda que todos os handshakes sejam recebidos (incluindo seus ACKs)
+  # O MsgHandler lida com a contagem de handshakes, então a thread principal apenas espera que ela atinja N-1
+  while (handShakeCount < N -1): # -1 porque não incluo meu próprio handshake na contagem
     pass
 
   print('Thread Principal: Handshakes enviados. handShakeCount=', str(handShakeCount))
 
-  # Send a sequence of data messages to all other processes 
+  # Envia uma sequência de mensagens de dados para todos os outros processos 
   for msgNumber in range(0, nMsgs):
     update_logical_clock()
     msg_content = msgNumber
     message_id = (myself, msg_content)
-    expected_acks[message_id] = set(peer for peer in PEERS if peer != get_public_ip())
+    # expected_acks deve conter os IPs dos pares, não os IDs numéricos
+    expected_acks[message_id] = set(peer_ip for peer_ip in PEERS if peer_ip != my_ip_address)
     received_acks[message_id] = set()
 
     msg = ('DATA', myself, logical_clock, msg_content)
     msgPack = pickle.dumps(msg)
     for addrToSend in PEERS:
-      if addrToSend != get_public_ip(): # Don't send to myself
+      if addrToSend != my_ip_address: # Não envia para si mesmo
         sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
     
     print(f'Enviada mensagem DATA {msg_content} (clock: {logical_clock}). Aguardando ACKs.')
 
-    # Wait for all ACKs for this specific message before sending the next
+    # Aguarda todos os ACKs para esta mensagem específica antes de enviar a próxima
     while len(received_acks.get(message_id, set())) < len(expected_acks.get(message_id, set())):
-      messages_to_process.wait(0.1) # Wait briefly, allowing MsgHandler to receive ACKs
-      msgHandler.process_next_message() # Try to process messages in queue
+      messages_to_process.wait(0.1) # Aguarda brevemente, permitindo que MsgHandler receba ACKs
+      msgHandler.process_next_message() # Tenta processar mensagens na fila
 
   print('Thread Principal: Todas as mensagens de dados enviadas. Aguardando ACKs finais e processamento da fila.')
 
-  # Ensure all ACKs are received and messages processed before sending stop signals
-  # This part can be tricky to get right without blocking
-  # For now, we will rely on the MsgHandler to eventually process everything.
-  # A more robust solution might involve specific signaling for this.
+  # Garante que todos os ACKs sejam recebidos e as mensagens processadas antes de enviar sinais de parada
+  # Para o propósito desta demonstração, dependemos do MsgHandler para eventualmente processar tudo.
 
-  # Tell all processes that I have no more messages to send
+  # Informa a todos os processos que não tenho mais mensagens para enviar
   for addrToSend in PEERS:
-    if addrToSend != get_public_ip(): # Don't send to myself
+    if addrToSend != my_ip_address: # Não envia para si mesmo
       update_logical_clock()
-      msg = (-1, myself, logical_clock, None) # Type -1 for stop signal
+      msg = (-1, myself, logical_clock, None) # Tipo -1 para sinal de parada
       msgPack = pickle.dumps(msg)
       sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
   
   print('Thread Principal: Sinais de parada enviados.')
 
-  # Wait for the message handler to finish processing all messages and send logs
+  # Aguarda o manipulador de mensagens terminar de processar todas as mensagens e enviar logs
   msgHandler.join()
   print('Thread Principal: Manipulador de mensagens finalizado.')
