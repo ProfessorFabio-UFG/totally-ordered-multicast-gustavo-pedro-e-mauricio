@@ -201,14 +201,16 @@ while 1:
   msgHandler.start()
   print('Handler iniciado.')
 
+  my_ip = get_public_ip() # Obtém o IP público do próprio par
   PEERS = getListOfPeers()
   
   for addrToSend in PEERS:
     logical_clock += 1
     msg = ('READY', myself, logical_clock)
     msgPack = pickle.dumps(msg)
-    sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
-    print(f'Enviando handshake READY para {addrToSend} com timestamp {logical_clock}')
+    if addrToSend != my_ip: # Evita enviar handshake para si mesmo
+        sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
+        print(f'Enviando handshake READY para {addrToSend} com timestamp {logical_clock}')
 
   print('Thread Principal: Todos os handshakes enviados. handShakeCount=', str(handShakeCount))
 
@@ -220,8 +222,8 @@ while 1:
     logical_clock += 1
     msg = ('DATA', (myself, msgNumber), logical_clock)
     msgPack = pickle.dumps(msg)
-    for i, addrToSend in enumerate(PEERS):
-      if PEERS[myself] != addrToSend: 
+    for addrToSend in PEERS:
+      if addrToSend != my_ip: # Evita enviar mensagem de dados para si mesmo
         sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
         print('Mensagem DATA ' + str(msgNumber) + ' enviada para ' + str(addrToSend) + ' com timestamp ' + str(logical_clock))
     
