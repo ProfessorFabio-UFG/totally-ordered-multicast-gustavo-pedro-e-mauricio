@@ -6,12 +6,13 @@ from requests import get
 import heapq
 from collections import defaultdict
 import time
+import sys
 
 # Variáveis globais
 handShakeCount = 0
 PEERS = []
 lamport_clock = 0
-myself = 0
+myself = -1
 
 # Estruturas para ordenação
 hold_back_queue = defaultdict(list)
@@ -20,225 +21,153 @@ expected_seq = defaultdict(int)
 # Sockets
 send_socket = socket(AF_INET, SOCK_DGRAM)
 recv_socket = socket(AF_INET, SOCK_DGRAM)
+recv_socket.settimeout(5.0)  # Timeout para evitar bloqueio eterno
 recv_socket.bind(('0.0.0.0', PEER_UDP_PORT))
 
-# Socket TCP
-server_sock = socket(AF_INET, SOCK_STREAM)
-server_sock.bind(('0.0.0.0', PEER_TCP_PORT))
-server_sock.listen(1)
-
 # Constantes para tipos de mensagem
-MSG_READY = 'READY'
-MSG_DATA = 'DATA'
-MSG_ACK = 'ACK'
-MSG_END = 'END'
+MSG_TYPES = {
+    'READY': 0,
+    'DATA': 1,
+    'ACK': 2,
+    'END': 3
+}
 
-def get_public_ip():
-    try:
-        ip = get('https://api.ipify.org', timeout=5).content.decode('utf8')
-        print(f'My public IP: {ip}')
-        return ip
-    except:
-        return '127.0.0.1'
+def get_unique_peers(peers_list):
+    """Remove peers duplicados mantendo a ordem"""
+    seen = set()
+    return [p for p in peers_list if not (p in seen or seen.add(p))]
 
-def register_with_manager():
-    try:
-        sock = socket(AF_INET, SOCK_STREAM)
-        sock.connect((GROUPMNGR_ADDR, GROUPMNGR_TCP_PORT))
-        req = {"op": "register", "ipaddr": get_public_ip(), "port": PEER_UDP_PORT}
-        sock.send(pickle.dumps(req))
-        sock.close()
-    except Exception as e:
-        print(f"Registration error: {e}")
-
-def get_peer_list():
-    try:
-        sock = socket(AF_INET, SOCK_STREAM)
-        sock.connect((GROUPMNGR_ADDR, GROUPMNGR_TCP_PORT))
-        sock.send(pickle.dumps({"op": "list"}))
-        peers = pickle.loads(sock.recv(2048))
-        sock.close()
-        return peers
-    except Exception as e:
-        print(f"Peer list error: {e}")
-        return []
-
-def update_clock(received_clock):
-    global lamport_clock
-    lamport_clock = max(lamport_clock, received_clock) + 1
-
-def create_message(msg_type, msg_id=None, ack_for=None):
+def create_message(msg_type, msg_id=0, ack_for=0):
     global lamport_clock
     lamport_clock += 1
-    
-    if msg_type == MSG_READY:
-        return (MSG_READY, myself, 0, lamport_clock)
-    elif msg_type == MSG_DATA:
-        return (MSG_DATA, myself, msg_id, lamport_clock)
-    elif msg_type == MSG_ACK:
-        return (MSG_ACK, myself, ack_for, lamport_clock)
-    elif msg_type == MSG_END:
-        return (MSG_END, myself, 0, lamport_clock)
+    return {
+        'type': msg_type,
+        'sender': myself,
+        'id': msg_id,
+        'ack_for': ack_for,
+        'timestamp': lamport_clock
+    }
 
-def send_message(dest, msg):
-    try:
-        send_socket.sendto(pickle.dumps(msg), (dest, PEER_UDP_PORT))
-    except Exception as e:
-        print(f"Send error: {e}")
-
-def validate_message(msg):
-    if not isinstance(msg, tuple) or len(msg) < 4:
-        return False
-    
-    msg_type = msg[0]
-    if msg_type == MSG_READY:
-        return len(msg) == 4
-    elif msg_type in (MSG_DATA, MSG_ACK):
-        return len(msg) == 4
-    elif msg_type == MSG_END:
-        return len(msg) == 4
-    return False
-
-def can_deliver(sender, msg_id):
-    return msg_id == expected_seq[sender]
-
-def deliver_message(msg):
-    try:
-        print(f'Delivered message {msg[2]} from {msg[1]} (ts: {msg[3]})')
-        expected_seq[msg[1]] += 1
-    except:
-        print("Delivery error")
-
-def check_pending_messages():
-    for sender in list(hold_back_queue.keys()):
-        while hold_back_queue[sender]:
-            msg = hold_back_queue[sender][0][1]
-            if can_deliver(sender, msg[2]):
-                _, msg = heapq.heappop(hold_back_queue[sender])
-                deliver_message(msg)
-            else:
-                break
-
-class MessageHandler(threading.Thread):
+class PeerSystem:
     def __init__(self):
-        threading.Thread.__init__(self)
         self.running = True
+        self.handshake_received = set()
+        self.peer_lock = threading.Lock()
+        
+    def reset(self):
+        with self.peer_lock:
+            global handShakeCount, lamport_clock
+            handShakeCount = 0
+            lamport_clock = 0
+            self.handshake_received.clear()
+            hold_back_queue.clear()
+            expected_seq.clear()
+
+system = PeerSystem()
+
+def message_handler():
+    print(f"Peer {myself} message handler started")
     
-    def run(self):
-        global handShakeCount, lamport_clock
-        
-        print("Message handler started")
-        
-        # Handshake phase
-        while handShakeCount < N and self.running:
-            try:
-                data, addr = recv_socket.recvfrom(1024)
-                msg = pickle.loads(data)
+    while system.running:
+        try:
+            data, addr = recv_socket.recvfrom(2048)
+            msg = pickle.loads(data)
+            
+            # Atualização do relógio lógico
+            system.peer_lock.acquire()
+            lamport_clock = max(lamport_clock, msg['timestamp']) + 1
+            
+            # Processamento de mensagens
+            if msg['type'] == 'READY':
+                if msg['sender'] not in system.handshake_received:
+                    system.handshake_received.add(msg['sender'])
+                    ack_msg = create_message('ACK', ack_for=msg['id'])
+                    send_socket.sendto(pickle.dumps(ack_msg), (addr[0], PEER_UDP_PORT))
+                    
+            elif msg['type'] == 'DATA':
+                heapq.heappush(hold_back_queue[msg['sender']], (msg['timestamp'], msg))
+                ack_msg = create_message('ACK', ack_for=msg['id'])
+                send_socket.sendto(pickle.dumps(ack_msg), (addr[0], PEER_UDP_PORT))
                 
-                if not validate_message(msg):
-                    print("Invalid handshake format")
-                    continue
+            elif msg['type'] == 'ACK':
+                pass  # Tratamento opcional de ACKs
                 
-                if msg[0] == MSG_READY:
-                    update_clock(msg[3])
-                    handShakeCount += 1
-                    print(f"Handshake from {msg[1]}")
-                    ack = create_message(MSG_ACK, ack_for=msg[2])
-                    send_message(addr[0], ack)
-            except Exception as e:
-                print(f"Handshake error: {e}")
+            elif msg['type'] == 'END':
+                system.running = False
+            
+            # Verificar mensagens prontas para entrega
+            deliver_messages()
+            
+            system.peer_lock.release()
+            
+        except timeout:
+            continue
+        except Exception as e:
+            print(f"Error: {str(e)}")
+            continue
 
-        print("All handshakes received")
-        
-        # Message processing
-        while self.running:
-            try:
-                data, addr = recv_socket.recvfrom(1024)
-                msg = pickle.loads(data)
-                
-                if not validate_message(msg):
-                    print("Invalid message format")
-                    continue
-                
-                # Update clock
-                update_clock(msg[3])
-                
-                if msg[0] == MSG_DATA:
-                    # Add to queue and send ACK
-                    heapq.heappush(hold_back_queue[msg[1]], (msg[3], msg))
-                    ack = create_message(MSG_ACK, ack_for=msg[2])
-                    send_message(addr[0], ack)
-                
-                elif msg[0] == MSG_ACK:
-                    pass  # ACKs are handled by clock update
-                
-                elif msg[0] == MSG_END:
-                    self.running = False
-                
-                # Check for deliverable messages
-                check_pending_messages()
-                
-            except Exception as e:
-                print(f"Processing error: {e}")
-
-def wait_for_start():
-    try:
-        conn, addr = server_sock.accept()
-        data = conn.recv(1024)
-        msg = pickle.loads(data)
-        global myself
-        myself = msg[0]
-        conn.send(pickle.dumps(f"Peer {myself} started"))
-        conn.close()
-        return msg[1]
-    except Exception as e:
-        print(f"Start error: {e}")
-        return 0
+def deliver_messages():
+    for sender in list(hold_back_queue.keys()):
+        while hold_back_queue[sender] and hold_back_queue[sender][0][1]['id'] == expected_seq[sender]:
+            _, msg = heapq.heappop(hold_back_queue[sender])
+            print(f"Peer {myself} delivered message {msg['id']} from {msg['sender']} (ts: {msg['timestamp']})")
+            expected_seq[sender] += 1
 
 def main():
-    register_with_manager()
-    while True:
-        print("Waiting for start signal...")
-        n_msgs = wait_for_start()
-        
-        if n_msgs <= 0:
-            break
-
-        print(f"I'm peer {myself} with {n_msgs} messages")
-        
-        global PEERS
-        PEERS = get_peer_list()
-        if not PEERS:
-            print("No peers available")
-            break
-        
-        handler = MessageHandler()
-        handler.daemon = True
-        handler.start()
-        
-        # Send handshakes
-        ready_msg = create_message(MSG_READY)
+    global myself, PEERS
+    
+    # Registro e obtenção de peers
+    peers = get_unique_peers(get_peer_list())
+    if not peers:
+        print("No valid peers found!")
+        return
+    
+    PEERS = [p for p in peers if p != get_public_ip()]
+    N = len(PEERS) + 1  # Ajuste dinâmico do número esperado de peers
+    
+    # Configuração inicial
+    myself = peers.index(get_public_ip()) if get_public_ip() in peers else -1
+    if myself == -1:
+        print("Peer not in peers list!")
+        return
+    
+    print(f"Peer {myself} started with {len(PEERS)} other peers")
+    
+    # Thread de tratamento de mensagens
+    handler_thread = threading.Thread(target=message_handler)
+    handler_thread.daemon = True
+    handler_thread.start()
+    
+    # Fase de handshake
+    ready_msg = create_message('READY')
+    for peer in PEERS:
+        send_socket.sendto(pickle.dumps(ready_msg), (peer, PEER_UDP_PORT))
+    
+    # Espera handshakes
+    while len(system.handshake_received) < N-1 and system.running:
+        time.sleep(0.1)
+    
+    print(f"Peer {myself} completed handshakes with {len(system.handshake_received)} peers")
+    
+    # Envio de mensagens
+    for i in range(2):  # 2 mensagens como no exemplo
+        data_msg = create_message('DATA', msg_id=i)
         for peer in PEERS:
-            send_message(peer, ready_msg)
-        
-        # Wait for handshakes
-        while handShakeCount < N:
-            time.sleep(0.1)
-        
-        # Send messages
-        for i in range(n_msgs):
-            data_msg = create_message(MSG_DATA, msg_id=i)
-            for peer in PEERS:
-                send_message(peer, data_msg)
-        
-        # Send end signal
-        end_msg = create_message(MSG_END)
-        for peer in PEERS:
-            send_message(peer, end_msg)
-        
-        # Wait for completion
-        while handler.running:
-            time.sleep(0.1)
+            send_socket.sendto(pickle.dumps(data_msg), (peer, PEER_UDP_PORT))
+        time.sleep(0.5)  # Intervalo entre mensagens
+    
+    # Finalização
+    end_msg = create_message('END')
+    for peer in PEERS:
+        send_socket.sendto(pickle.dumps(end_msg), (peer, PEER_UDP_PORT))
+    
+    handler_thread.join(timeout=10)
+    print(f"Peer {myself} finished processing")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+        system.running = False
+        sys.exit(0)
