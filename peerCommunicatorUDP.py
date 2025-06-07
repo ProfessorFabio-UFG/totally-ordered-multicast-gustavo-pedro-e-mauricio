@@ -139,7 +139,7 @@ while True:
     print('[LOG] I am process', myself)
 
     if nMsgs == 0:
-        print('[LOG] Termination signal received. Exiting...')
+        print('[LOG] Termination signal received. Exiting.../')
         exit(0)
 
     time.sleep(5)
