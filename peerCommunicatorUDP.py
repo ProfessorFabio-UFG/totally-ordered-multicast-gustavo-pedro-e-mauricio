@@ -8,7 +8,7 @@ from requests import get
 import heapq
 
 handShakeCount = 0
-
+N = 2
 PEERS = []
 
 sendSocket = socket(AF_INET, SOCK_DGRAM)
@@ -50,10 +50,12 @@ def getListOfPeers():
   print ('Obtendo lista de pares do gerenciador de grupo: ', req)
   clientSock.send(msg)
   msg = clientSock.recv(2048)
-  PEERS = pickle.loads(msg)
-  print ('Lista de pares obtida: ', PEERS)
+  raw_peers = pickle.loads(msg)
+  # Garante IPs únicos e mantém a ordem para consistência de IDs
+  unique_peers = sorted(list(set(raw_peers)))
+  print ('Lista de pares obtida: ', unique_peers)
   clientSock.close()
-  return PEERS
+  return unique_peers
 
 def update_logical_clock(received_timestamp):
   global logical_clock
@@ -228,17 +230,20 @@ while 1:
     msg = ('DATA', (myself, msgNumber), logical_clock)
     msgPack = pickle.dumps(msg)
     for i, addrToSend in enumerate(PEERS):
-      if i != myself: # Não envia mensagem para si mesmo
+      # Verifica se o endereço na lista PEERS corresponde ao seu próprio IP para não enviar para si mesmo
+      # ou se o ID do par na lista PEERS não é o seu próprio ID
+      if PEERS[myself] != addrToSend: 
         sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
         print('Mensagem DATA ' + str(msgNumber) + ' enviada para ' + str(addrToSend) + ' com timestamp ' + str(logical_clock))
     
     ack_key = (myself, msgNumber)
     start_time = time.time()
-    print(f'Aguardando ACKs para mensagem {msgNumber} (esperando {N-1} ACKs).')
+    # Espera por ACKs de todos os outros pares, ou seja, N-1 ACKs
+    print(f'Aguardando ACKs para mensagem {msgNumber} (esperando {len(PEERS) -1} ACKs).')
     # Espera até que todos os ACKs sejam recebidos ou que o tempo limite seja atingido
-    while len(acks_received.get(ack_key, [])) < N - 1:
+    while len(acks_received.get(ack_key, [])) < (len(PEERS) - 1):
         if time.time() - start_time > 5: # Tempo limite de 5 segundos
-            print(f"Tempo limite excedido ao aguardar ACKs para a mensagem {msgNumber}. Recebido {len(acks_received.get(ack_key, []))} de {N-1} ACKs.")
+            print(f"Tempo limite excedido ao aguardar ACKs para a mensagem {msgNumber}. Recebido {len(acks_received.get(ack_key, []))} de {len(PEERS)-1} ACKs.")
             break
     print(f'Todos os ACKs recebidos (ou tempo limite) para a mensagem {msgNumber}.')
 
