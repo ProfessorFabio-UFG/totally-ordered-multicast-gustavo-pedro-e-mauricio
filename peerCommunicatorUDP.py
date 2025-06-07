@@ -7,6 +7,7 @@ from requests import get
 import heapq
 
 handShakeCount = 0
+ready_acks_for_my_handshake_count = 0 # Novo contador para ACKs de handshakes que eu enviei
 PEERS = []
 logical_clock = 0
 message_queue = [] # Min-heap para armazenar mensagens com base no seu timestamp
@@ -72,9 +73,12 @@ class MsgHandler(threading.Thread):
     global handShakeCount
     global logical_clock
     global myself
+    global ready_acks_for_my_handshake_count # Acessa a nova variável global
 
     # Fase 1: Handshake
-    while handShakeCount < N - 1: # Aguarda handshakes de N-1 outros pares
+    # Este loop processa tanto 'READY' quanto 'ACK_READY' durante a fase de handshake
+    # A transição para a fase 2 (data exchange) é controlada pela thread principal.
+    while True: # Loop infinito durante a fase de handshake, a saída é controlada externamente
       try:
         msgPack = self.sock.recv(1024)
         received_msg = pickle.loads(msgPack)
@@ -87,11 +91,22 @@ class MsgHandler(threading.Thread):
             ack_msg = ('ACK_READY', myself, logical_clock, sender_numerical_id) 
             sendSocket.sendto(pickle.dumps(ack_msg), (sender_ip_address, PEER_UDP_PORT))
         elif len(received_msg) == 4 and received_msg[0] == 'ACK_READY':
-            msg_type, ack_sender_id, ack_timestamp, original_sender_id = received_msg
+            msg_type, ack_sender_id, ack_timestamp, original_sender_id_of_ready = received_msg
             update_logical_clock(ack_timestamp)
-            print(f"--- ACK_READY recebido de {ack_sender_id}. Meu clock: {logical_clock}")
+            print(f"--- ACK_READY recebido de {ack_sender_id} para READY de {original_sender_id_of_ready}. Meu clock: {logical_clock}")
+            if original_sender_id_of_ready == myself:
+                # Este ACK_READY é para um handshake *que eu enviei*
+                ready_acks_for_my_handshake_count += 1
+                print(f"ACK para meu handshake recebido de {ack_sender_id}. Total de ACKs de handshake recebidos: {ready_acks_for_my_handshake_count}/{N-1}")
         else:
             print(f"Aviso: Mensagem de handshake inesperada durante fase de handshake: {received_msg}")
+        
+        # Se as condições do handshake forem atendidas, o manipulador pode sair do loop de handshake.
+        # No entanto, como a thread principal também espera por isso, manteremos o loop infinito
+        # e a thread principal fará a transição.
+        if handShakeCount == N - 1 and ready_acks_for_my_handshake_count == N - 1:
+            break # Todos os handshakes e seus ACKs foram processados ou aguardados
+
       except Exception as e:
         print(f"Erro durante o handshake: {e}")
 
@@ -128,12 +143,11 @@ class MsgHandler(threading.Thread):
 
           # Inicializa expected_acks e received_acks para esta mensagem se for a primeira vez que a vemos
           if message_id not in expected_acks:
-              # Espera ACKs de todos os outros peers (N-1) para que esta mensagem possa ser entregue localmente em ordem total.
-              expected_acks[message_id] = set(i for i in range(N) if i != sender_id)
+              # Espera ACKs de TODOS os N peers, incluindo o próprio remetente original da DATA
+              expected_acks[message_id] = set(range(N))
               received_acks[message_id] = set()
           
           # Adiciona o próprio ID do peer ao conjunto de ACKs recebidos, pois ele acabou de processar a mensagem
-          # Isso é um reconhecimento local.
           received_acks[message_id].add(myself)
           messages_to_process.set() # Sinaliza que pode haver mensagens para processar
 
@@ -145,9 +159,9 @@ class MsgHandler(threading.Thread):
 
           # Garante que os dicionários existam para a mensagem que está sendo reconhecida
           if message_id not in expected_acks:
-              # Isso pode acontecer se recebemos um ACK para uma mensagem que ainda não processamos como DATA.
-              # Nesse caso, assumimos que é uma mensagem que eventualmente será enfileirada e precisa de ACKs de todos.
-              expected_acks[message_id] = set(i for i in range(N) if i != original_sender)
+              # Se um ACK chega antes da DATA correspondente (ex: reordenação de rede),
+              # inicializamos a expectativa de ACK para que a DATA possa ser processada corretamente depois.
+              expected_acks[message_id] = set(range(N))
           
           if message_id not in received_acks:
               received_acks[message_id] = set()
@@ -181,6 +195,7 @@ class MsgHandler(threading.Thread):
     
     handShakeCount = 0
     logical_clock = 0
+    ready_acks_for_my_handshake_count = 0 # Resetar também
     print("Manipulador encerrado.")
     exit(0)
 
@@ -202,16 +217,16 @@ class MsgHandler(threading.Thread):
         expected_ack_senders = expected_acks[message_id]
         received_ack_senders = received_acks.get(message_id, set())
 
-        # Verifica se todos os ACKs esperados foram recebidos
-        if expected_ack_senders.issubset(received_ack_senders) and len(expected_ack_senders) == len(received_ack_senders):
+        # Verifica se todos os N ACKs esperados foram recebidos (todos os peers do sistema)
+        if len(received_ack_senders) == N: # Agora esperamos N ACKs (1 de si mesmo + N-1 dos outros)
             # Mensagem pronta para ser entregue
             timestamp, sender, content = heapq.heappop(message_queue) # Remove da fila
             print(f'Mensagem {content} de processo {sender} (clock: {timestamp}) entregue à aplicação. Meu clock: {logical_clock}')
             self.logList.append((sender, content, timestamp))
             # Limpa os ACKs relacionados a esta mensagem para evitar crescimento de memória
-            if message_id in expected_acks: # Verifica novamente, pois pode ser removido em outra chamada
+            if message_id in expected_acks: 
               del expected_acks[message_id]
-            if message_id in received_acks: # Verifica novamente, pois pode ser removido em outra chamada
+            if message_id in received_acks:
               del received_acks[message_id]
             # Chama recursivamente para verificar se a próxima mensagem na fila pode ser processada
             self.process_next_message()
@@ -221,8 +236,6 @@ class MsgHandler(threading.Thread):
     else:
         # Este bloco indica uma mensagem no topo da fila que não está sendo rastreada para ACKs.
         # Para um protocolo de ordenação total, isso não deve acontecer para mensagens DATA.
-        # Se ocorrer, pode indicar um erro na lógica de inicialização de expected_acks ou um tipo de mensagem
-        # que não deveria estar na fila de ordenação total.
         print(f'ERRO CRÍTICO: Mensagem {next_msg_content} de processo {next_msg_sender} (clock: {next_msg_timestamp}) no topo da fila sem rastreamento de ACK. Isso indica um problema de inicialização. Não entregando. Meu clock: {logical_clock}')
         return # Não entrega esta mensagem se ela não está sendo rastreada para ACKs
 
@@ -266,12 +279,11 @@ while True:
       msgPack = pickle.dumps(msg)
       sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
 
-  # Aguarda que todos os handshakes sejam recebidos (incluindo seus ACKs)
-  # O MsgHandler lida com a contagem de handshakes, então a thread principal apenas espera que ela atinja N-1
-  while (handShakeCount < N -1): # -1 porque não incluo meu próprio handshake na contagem
+  # Aguarda que todos os handshakes sejam recebidos (READYs de outros) E que meus handshakes sejam ACKados
+  while (handShakeCount < N - 1) or (ready_acks_for_my_handshake_count < N - 1):
     pass
 
-  print('Thread Principal: Handshakes enviados. handShakeCount=', str(handShakeCount))
+  print('Thread Principal: Handshakes enviados e ACKs recebidos. handShakeCount=', str(handShakeCount), 'ready_acks_for_my_handshake_count=', ready_acks_for_my_handshake_count)
 
   # Envia uma sequência de mensagens de dados para todos os outros processos 
   for msgNumber in range(0, nMsgs):
@@ -280,8 +292,8 @@ while True:
     message_id = (myself, msg_content) # ID da mensagem enviada por mim
     
     # Inicializa expected_acks e received_acks para a mensagem que estou enviando
-    # Espero ACKs de todos os outros peers (N-1)
-    expected_acks[message_id] = set(i for i in range(N) if i != myself)
+    # Espero ACKs de TODOS os N peers (1 de si mesmo + N-1 dos outros)
+    expected_acks[message_id] = set(range(N))
     received_acks[message_id] = set()
     # Adiciono meu próprio ID como "ACK" local de que processei esta mensagem enviada por mim
     received_acks[message_id].add(myself)
@@ -296,7 +308,8 @@ while True:
     print(f'Enviada mensagem DATA {msg_content} (clock: {logical_clock}). Aguardando ACKs.')
 
     # Aguarda todos os ACKs para esta mensagem específica antes de enviar a próxima
-    while len(received_acks.get(message_id, set())) < len(expected_acks.get(message_id, set())):
+    # A condição mudou para esperar N ACKs no total
+    while len(received_acks.get(message_id, set())) < N:
       messages_to_process.wait(0.1) # Aguarda brevemente, permitindo que MsgHandler receba ACKs
       msgHandler.process_next_message() # Tenta processar mensagens na fila
 
