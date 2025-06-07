@@ -55,7 +55,7 @@ def deliver_messages():
   i = 0
   while i < len(message_queue):
       msg = message_queue[i]
-      if msg['sender_id'] != myself and msg['timestamp'] <= logical_clock: # Simple delivery condition
+      if 'sender_id' in msg and 'timestamp' in msg and msg['sender_id'] != myself and msg['timestamp'] <= logical_clock:
           delivered_messages.append(msg)
           message_queue.pop(i)
       else:
@@ -79,7 +79,7 @@ class MsgHandler(threading.Thread):
         update_logical_clock(msg[2])
         handShakeCount = handShakeCount + 1
         ack_msg = ('ACK_HANDSHAKE', myself, logical_clock)
-        sendSocket.sendto(pickle.dumps(ack_msg), (msg[1], PEER_UDP_PORT))
+        sendSocket.sendto(pickle.dumps(ack_msg), (msg[3], PEER_UDP_PORT))
 
     stopCount = 0 
     while True:                
@@ -97,8 +97,17 @@ class MsgHandler(threading.Thread):
       elif msg[0] == 'ACK_HANDSHAKE':
         pass 
       else:
-        message_queue.append(msg)
-        ack_msg = ('ACK', myself, logical_clock, msg[0], msg[1])
+        # Assuming data messages are structured as (sender_id, msg_number, timestamp, sender_ip)
+        # Store as a dictionary for easier access to fields and future extensibility
+        processed_msg = {
+            'sender_id': msg[0],
+            'msg_number': msg[1],
+            'timestamp': msg[2],
+            'sender_ip': msg[3]
+        }
+        message_queue.append(processed_msg)
+        
+        ack_msg = ('ACK', myself, logical_clock, get_public_ip())
         sendSocket.sendto(pickle.dumps(ack_msg), (msg[3], PEER_UDP_PORT))
         
         delivered = deliver_messages()
@@ -141,9 +150,11 @@ while 1:
 
   PEERS = getListOfPeers()
   
+  my_public_ip = get_public_ip() # Get IP once to avoid multiple calls
+
   for addrToSend in PEERS:
     logical_clock += 1
-    msg = ('READY', myself, logical_clock)
+    msg = ('READY', myself, logical_clock, my_public_ip)
     msgPack = pickle.dumps(msg)
     sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
 
@@ -152,13 +163,14 @@ while 1:
 
   for msgNumber in range(0, nMsgs):
     logical_clock += 1
-    msg = (myself, msgNumber, logical_clock, get_public_ip())
+    # Include sender's IP address in data messages too
+    msg = (myself, msgNumber, logical_clock, my_public_ip)
     msgPack = pickle.dumps(msg)
     for addrToSend in PEERS:
       sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
 
   for addrToSend in PEERS:
     logical_clock += 1
-    msg = (-1,-1, logical_clock)
+    msg = (-1,-1, logical_clock, my_public_ip) # Include IP for stop messages
     msgPack = pickle.dumps(msg)
     sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
