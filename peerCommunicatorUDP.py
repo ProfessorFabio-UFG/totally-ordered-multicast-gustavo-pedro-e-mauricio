@@ -49,10 +49,11 @@ def getListOfPeers():
   print ('Obtendo lista de pares do gerenciador de grupo: ', req)
   clientSock.send(msg)
   msg = clientSock.recv(2048)
-  PEERS = pickle.loads(msg)
-  print ('Lista de pares obtida: ', PEERS)
+  # Garante que a lista de pares seja única
+  unique_peers = list(set(pickle.loads(msg)))
+  print ('Lista de pares única obtida: ', unique_peers)
   clientSock.close()
-  return PEERS
+  return unique_peers
 
 def update_logical_clock(received_timestamp=0):
   global logical_clock
@@ -87,7 +88,7 @@ class MsgHandler(threading.Thread):
       elif msg_type == 'ACK_READY':
         # Este ACK significa que um handshake enviado por mim foi reconhecido
         # O 'content' de ACK_READY é o ID numérico do peer que enviou o READY original
-        acked_peer_numerical_id = sender_numerical_id # O 'sender_id' do ACK é o 'myself' do peer que ACKou
+        # Note: sender_numerical_id aqui é o 'myself' do peer que enviou o ACK
         print(f"--- ACK_READY recebido de {sender_numerical_id}. Meu clock: {logical_clock}")
 
     print('Thread Secundária: Recebeu todos os handshakes. Entrando no loop para receber mensagens.')
@@ -96,7 +97,8 @@ class MsgHandler(threading.Thread):
     while not self.stop_event.is_set() or stopCount < N:                
       try:
         msgPack = self.sock.recv(1024)
-        msg_type, sender_id, msg_timestamp, content = pickle.loads(msgPack)
+        # Ajusta o desempacotamento para incluir o IP do remetente de dados
+        msg_type, sender_id, msg_timestamp, content, sender_data_ip_address = pickle.loads(msgPack)
         update_logical_clock(msg_timestamp)
 
         if msg_type == -1:
@@ -110,33 +112,16 @@ class MsgHandler(threading.Thread):
           # 2. Coloca a mensagem na fila
           heapq.heappush(message_queue, (msg_timestamp, sender_id, content))
           print(f"Mensagem DATA {content} de {sender_id} (clock: {msg_timestamp}) enfileirada. Meu clock: {logical_clock}")
-          # 3. Enviar ACK
+          # 3. Enviar ACK de volta para o IP de origem da mensagem DATA
           ack_msg = ('ACK', myself, logical_clock, (sender_id, content)) # ACK para a mensagem específica
-          # Para enviar o ACK, precisamos do IP do remetente original. Assumimos que PEERS lista de IPs
-          # Para simplificar, o peer que enviou a mensagem de dados (sender_id) é um ID numérico.
-          # O sistema atual não tem um mapeamento direto de sender_id para IP aqui.
-          # No entanto, como o ACK_READY já está enviando para o IP, vamos assumir que para DATA,
-          # o 'sender_id' na mensagem DATA é o IP. Se 'sender_id' for o ID numérico, teremos um problema similar.
-          # Pela estrutura atual, 'sender_id' de DATA é o ID numérico do peer.
-          # PRECISAMOS SABER O IP DO REMETENTE DA MENSAGEM DATA PARA ENVIAR O ACK!
-          # Para resolver isso, a mensagem DATA também deveria conter o IP do remetente.
-          # Por agora, vamos usar PEERS[sender_id] se os IDs numéricos corresponderem aos índices da lista PEERS.
-          # Se não, precisaríamos de um mapeamento explícito ou de outra estrutura.
-
-          # ASSUMIMOS AQUI QUE PEERS É UMA LISTA DE IPS E QUE O ID NUMÉRICO DO REMETENTE (sender_id)
-          # PODE SER USADO COMO ÍNDICE PARA OBTER SEU IP. ISSO PODE NÃO SER GARANTIDO NO CENÁRIO REAL.
-          # Uma solução mais robusta seria a mensagem DATA conter o IP de origem.
-          if sender_id < len(PEERS): # Se sender_id é um ID numérico que corresponde a um índice na lista PEERS
-              sendSocket.sendto(pickle.dumps(ack_msg), (PEERS[sender_id], PEER_UDP_PORT))
-          else: # Se sender_id não é um ID numérico, ou não corresponde a um índice
-              print(f"Erro: Não foi possível enviar ACK para {sender_id}. IP do remetente de DATA não encontrado.")
+          sendSocket.sendto(pickle.dumps(ack_msg), (sender_data_ip_address, PEER_UDP_PORT))
 
         elif msg_type == 'ACK':
           # 1. Atualiza o relógio lógico (já feito acima)
-          # 2. Coloca a mensagem na fila (ACKs não precisam de ACKs, mas registramos)
           original_sender, original_content = content
           if (original_sender, original_content) not in received_acks:
               received_acks[(original_sender, original_content)] = set()
+          # sender_id aqui é o ID numérico do peer que enviou o ACK
           received_acks[(original_sender, original_content)].add(sender_id)
           print(f"ACK para DATA {original_content} de {original_sender} recebido de {sender_id}. Meu clock: {logical_clock}")
           messages_to_process.set() # Sinaliza que pode haver mensagens para processar
@@ -178,7 +163,11 @@ class MsgHandler(threading.Thread):
 
       # Verifica se todos os ACKs esperados para esta mensagem foram recebidos
       if message_id in expected_acks:
-        if expected_acks[message_id].issubset(received_acks.get(message_id, set())):
+        # A comparação deve ser com o conjunto de IDs numéricos de pares que enviaram ACK
+        expected_ack_senders = expected_acks[message_id]
+        received_ack_senders = received_acks.get(message_id, set())
+
+        if expected_ack_senders.issubset(received_ack_senders) and len(expected_ack_senders) == len(received_ack_senders):
           # Mensagem pronta para ser entregue
           timestamp, sender, content = heapq.heappop(message_queue)
           print(f'Mensagem {content} de processo {sender} (clock: {timestamp}) entregue à aplicação. Meu clock: {logical_clock}')
@@ -192,8 +181,8 @@ class MsgHandler(threading.Thread):
           # Nem todos os ACKs recebidos, espera
           return
       else:
-        # Se não houver entrada em expected_acks, significa que é um ACK ou uma mensagem enviada por mim mesmo
-        # (que não requer ACKs de outros)
+        # Se não houver entrada em expected_acks, significa que é uma mensagem enviada por mim mesmo
+        # (que não requer ACKs de outros) ou um tipo de mensagem que não exige ACKs.
         timestamp, sender, content = heapq.heappop(message_queue)
         print(f'Mensagem {content} de processo {sender} (clock: {timestamp}) entregue à aplicação (sem ACK esperado). Meu clock: {logical_clock}')
         self.logList.append((sender, content, timestamp))
@@ -250,11 +239,23 @@ while True:
     update_logical_clock()
     msg_content = msgNumber
     message_id = (myself, msg_content)
-    # expected_acks deve conter os IPs dos pares, não os IDs numéricos
-    expected_acks[message_id] = set(peer_ip for peer_ip in PEERS if peer_ip != my_ip_address)
-    received_acks[message_id] = set()
+    # expected_acks deve conter os IDs numéricos dos pares que esperamos um ACK
+    # Para isso, precisamos de um mapeamento de IP para ID numérico, ou o GroupMngr precisa
+    # fornecer os IDs junto com os IPs. Por simplicidade, vamos assumir que o ID numérico
+    # do peer que esperamos um ACK é o ID do peer. O IP de destino do ACK é resolvido
+    # quando a mensagem DATA é enviada e recebida, usando o sender_data_ip_address.
+    
+    # Criar um conjunto de IDs numéricos esperados para ACK
+    expected_ack_ids = set()
+    for i in range(N):
+      if i != myself: # Não espera ACK de si mesmo
+        expected_ack_ids.add(i) # Adiciona o ID numérico do peer
 
-    msg = ('DATA', myself, logical_clock, msg_content)
+    expected_acks[message_id] = expected_ack_ids
+    received_acks[message_id] = set() # Este set armazenará os IDs numéricos dos peers que enviaram ACK
+
+    # A mensagem DATA agora inclui o IP do remetente para que o receptor saiba para onde enviar o ACK
+    msg = ('DATA', myself, logical_clock, msg_content, my_ip_address)
     msgPack = pickle.dumps(msg)
     for addrToSend in PEERS:
       if addrToSend != my_ip_address: # Não envia para si mesmo
@@ -276,7 +277,8 @@ while True:
   for addrToSend in PEERS:
     if addrToSend != my_ip_address: # Não envia para si mesmo
       update_logical_clock()
-      msg = (-1, myself, logical_clock, None) # Tipo -1 para sinal de parada
+      # A mensagem de parada agora inclui o IP do remetente para consistência, embora não seja estritamente necessário para ela
+      msg = (-1, myself, logical_clock, None, my_ip_address) # Tipo -1 para sinal de parada
       msgPack = pickle.dumps(msg)
       sendSocket.sendto(msgPack, (addrToSend,PEER_UDP_PORT))
   
