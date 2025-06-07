@@ -5,22 +5,19 @@ import heapq
 import pickle
 from collections import defaultdict
 
-# Porta TCP para escutar conexões dos peers
 PEER_TCP_PORT = 6000
-# Porta UDP para envio de mensagens multicast
 PEER_UDP_PORT = 5000
 
 class Peer:
     def __init__(self, myself, peers):
         self.myself = myself
-        self.peers = sorted(peers)  # ordena para desempate
+        self.peers = sorted(peers)
         self.timestamp = 0
         self.lock = threading.Lock()
         self.condition = threading.Condition(self.lock)
 
-        # Fila de mensagens como heap [(timestamp, sender, message)]
         self.message_queue = []
-        self.acks_received = defaultdict(set)  # {(timestamp, sender): set(peer_ids)}
+        self.acks_received = defaultdict(set)
 
         self.start_udp_listener()
         self.start_tcp_listener()
