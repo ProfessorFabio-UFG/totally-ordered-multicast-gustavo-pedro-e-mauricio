@@ -49,7 +49,7 @@ def getListOfPeers():
   print ('Obtendo lista de pares do gerenciador de grupo: ', req)
   clientSock.send(msg)
   msg = clientSock.recv(2048)
-  # Garante que a lista de pares seja única
+  # Garante que a lista de pares seja única antes de tentar conectar
   unique_peers = list(set(pickle.loads(msg)))
   print ('Lista de pares única obtida: ', unique_peers)
   clientSock.close()
@@ -74,22 +74,28 @@ class MsgHandler(threading.Thread):
     global myself
 
     while handShakeCount < N - 1: # Aguarda handshakes de N-1 outros pares
-      msgPack = self.sock.recv(1024)
-      # Desempacota a mensagem, esperando o ID numérico do remetente e o endereço IP
-      msg_type, sender_numerical_id, msg_timestamp, sender_ip_address = pickle.loads(msgPack)
-      update_logical_clock(msg_timestamp)
-
-      if msg_type == 'READY':
-        handShakeCount += 1
-        print(f'--- Handshake recebido de ID: {sender_numerical_id}, IP: {sender_ip_address}, Clock: {logical_clock}')
-        # Envia ACK de handshake de volta para o endereço IP do remetente
-        ack_msg = ('ACK_READY', myself, logical_clock, sender_numerical_id) # Conteúdo é o ID numérico do peer cujo handshake está sendo ACKado
-        sendSocket.sendto(pickle.dumps(ack_msg), (sender_ip_address, PEER_UDP_PORT))
-      elif msg_type == 'ACK_READY':
-        # Este ACK significa que um handshake enviado por mim foi reconhecido
-        # O 'content' de ACK_READY é o ID numérico do peer que enviou o READY original
-        # Note: sender_numerical_id aqui é o 'myself' do peer que enviou o ACK
-        print(f"--- ACK_READY recebido de {sender_numerical_id}. Meu clock: {logical_clock}")
+      try:
+        msgPack = self.sock.recv(1024)
+        received_msg = pickle.loads(msgPack)
+        
+        # O handshake READY sempre tem 4 elementos: ('READY', myself, logical_clock, my_ip_address)
+        if len(received_msg) == 4 and received_msg[0] == 'READY':
+            msg_type, sender_numerical_id, msg_timestamp, sender_ip_address = received_msg
+            update_logical_clock(msg_timestamp)
+            handShakeCount += 1
+            print(f'--- Handshake recebido de ID: {sender_numerical_id}, IP: {sender_ip_address}, Clock: {logical_clock}')
+            # Envia ACK de handshake de volta para o endereço IP do remetente
+            ack_msg = ('ACK_READY', myself, logical_clock, sender_numerical_id) 
+            sendSocket.sendto(pickle.dumps(ack_msg), (sender_ip_address, PEER_UDP_PORT))
+        elif len(received_msg) == 4 and received_msg[0] == 'ACK_READY':
+            # Este ACK significa que um handshake enviado por mim foi reconhecido
+            msg_type, ack_sender_id, ack_timestamp, original_sender_id = received_msg
+            update_logical_clock(ack_timestamp)
+            print(f"--- ACK_READY recebido de {ack_sender_id}. Meu clock: {logical_clock}")
+        else:
+            print(f"Aviso: Mensagem de handshake inesperada durante fase de handshake: {received_msg}")
+      except Exception as e:
+        print(f"Erro durante o handshake: {e}")
 
     print('Thread Secundária: Recebeu todos os handshakes. Entrando no loop para receber mensagens.')
 
@@ -100,33 +106,36 @@ class MsgHandler(threading.Thread):
         received_msg = pickle.loads(msgPack)
 
         msg_type = received_msg[0]
-        update_logical_clock(received_msg[2]) # Atualiza o clock com o timestamp da mensagem
-
-        if msg_type == -1:
-          # Lida com a mensagem de parada
-          sender_id, msg_timestamp, content, sender_data_ip_address = received_msg[1:] # Desempacota os 4 elementos restantes
+        
+        if msg_type == -1 and len(received_msg) == 5:
+          # Lida com a mensagem de parada: (-1, sender_id, msg_timestamp, None, sender_data_ip_address)
+          sender_id, msg_timestamp, content, sender_data_ip_address = received_msg[1:]
+          update_logical_clock(msg_timestamp)
           stopCount += 1
-          print(f"Mensagem de parada de {sender_id}. Contagem de paradas: {stopCount}/{N}")
+          print(f"Mensagem de parada de {sender_id}. Contagem de paradas: {stopCount}/{N}. Meu clock: {logical_clock}")
           if stopCount == N:
             self.stop_event.set()
             break
-        elif msg_type == 'DATA':
-          # Lida com a mensagem de dados
-          sender_id, msg_timestamp, content, sender_data_ip_address = received_msg[1:] # Desempacota os 4 elementos restantes
+        elif msg_type == 'DATA' and len(received_msg) == 5:
+          # Lida com a mensagem de dados: ('DATA', sender_id, msg_timestamp, content, sender_data_ip_address)
+          sender_id, msg_timestamp, content, sender_data_ip_address = received_msg[1:]
+          update_logical_clock(msg_timestamp)
           heapq.heappush(message_queue, (msg_timestamp, sender_id, content))
           print(f"Mensagem DATA {content} de {sender_id} (clock: {msg_timestamp}) enfileirada. Meu clock: {logical_clock}")
           ack_msg = ('ACK', myself, logical_clock, (sender_id, content)) # ACK para a mensagem específica
           sendSocket.sendto(pickle.dumps(ack_msg), (sender_data_ip_address, PEER_UDP_PORT))
-        elif msg_type == 'ACK':
-          # Lida com a mensagem de ACK
-          ack_sender_id, ack_timestamp, original_msg_info = received_msg[1:] # Desempacota os 3 elementos restantes
+        elif msg_type == 'ACK' and len(received_msg) == 4:
+          # Lida com a mensagem de ACK: ('ACK', ack_sender_id, ack_timestamp, original_msg_info)
+          ack_sender_id, ack_timestamp, original_msg_info = received_msg[1:]
+          update_logical_clock(ack_timestamp)
           original_sender, original_content = original_msg_info
           if (original_sender, original_content) not in received_acks:
               received_acks[(original_sender, original_content)] = set()
-          # sender_id aqui é o ID numérico do peer que enviou o ACK
           received_acks[(original_sender, original_content)].add(ack_sender_id)
           print(f"ACK para DATA {original_content} de {original_sender} recebido de {ack_sender_id}. Meu clock: {logical_clock}")
           messages_to_process.set() # Sinaliza que pode haver mensagens para processar
+        else:
+            print(f"Aviso: Mensagem recebida com formato inesperado: {received_msg}. Ignorando.")
 
       except BlockingIOError:
         pass # Nenhum dado disponível, continua o loop
@@ -165,7 +174,6 @@ class MsgHandler(threading.Thread):
 
       # Verifica se todos os ACKs esperados para esta mensagem foram recebidos
       if message_id in expected_acks:
-        # A comparação deve ser com o conjunto de IDs numéricos de pares que enviaram ACK
         expected_ack_senders = expected_acks[message_id]
         received_ack_senders = received_acks.get(message_id, set())
 
