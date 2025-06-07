@@ -1,6 +1,6 @@
 from socket import *
 import pickle
-from constMP import * # Certifique-se que N esteja correto aqui!
+from constMP import *
 import time
 import sys
 
@@ -24,16 +24,16 @@ def mainLoop():
 		peerList = pickle.loads(msg)
 		print("List of Peers: ", peerList)
 		startPeers(peerList,nMsgs)
-		print('Agora, aguarde os logs de mensagens dos pares comunicantes...')
+		print('Now, wait for the message logs from the communicating peers...')
 		waitForLogsAndCompare(nMsgs)
 	serverSock.close()
 
 def promptUser():
-	nMsgs = int(input('Digite o número de mensagens para cada par enviar (0 para terminar)=> '))
+	nMsgs = int(input('Enter the number of messages for each peer to send (0 to terminate)=> '))
 	return nMsgs
 
 def startPeers(peerList,nMsgs):
-	# Conecta a cada um dos pares e envia o sinal de 'iniciar':
+	# Connect to each of the peers and send the 'initiate' signal:
 	peerNumber = 0
 	for peer in peerList:
 		clientSock = socket(AF_INET, SOCK_STREAM)
@@ -47,45 +47,31 @@ def startPeers(peerList,nMsgs):
 		peerNumber = peerNumber + 1
 
 def waitForLogsAndCompare(N_MSGS):
-	# Loop para aguardar os logs de mensagens para comparação:
+	# Loop to wait for the message logs for comparison:
 	numPeers = 0
-	msgs = [] # cada msg é uma lista de tuplas (com as mensagens originais recebidas pelos processos pares)
+	msgs = [] # each msg is a list of tuples (with the original messages received by the peer processes)
 
-	# Recebe os logs de mensagens dos processos pares
-	while numPeers < N: # Usa N do constMP.py
+	# Receive the logs of messages from the peer processes
+	while numPeers < N:
 		(conn, addr) = serverSock.accept()
 		msgPack = conn.recv(32768)
-		print ('Log recebido do par')
+		print ('Received log from peer')
 		conn.close()
-		log_data = pickle.loads(msgPack)
-		msgs.append(log_data)
-		print(f"Log do par {addr}: comprimento={len(log_data)}") # Adiciona info sobre o comprimento do log
+		msgs.append(pickle.loads(msgPack))
 		numPeers = numPeers + 1
 
 	unordered = 0
 
-	# Determina o comprimento mínimo entre todos os logs recebidos para comparação
-	min_log_length = N_MSGS # Inicializa com o máximo esperado
-	if msgs: # Garante que msgs não está vazia
-		min_log_length = min(len(log) for log in msgs)
+	# Compare the lists of messages
+	for j in range(0,N_MSGS-1):
+		firstMsg = msgs[0][j]
+		for i in range(1,N-1):
+			if firstMsg != msgs[i][j]:
+				unordered = unordered + 1
+				break
 	
-	print(f"Comparando até {min_log_length} mensagens.")
-
-	# Compara as listas de mensagens até o comprimento mínimo
-	# Certifica-se de que há pelo menos um log para comparar (msgs[0])
-	if msgs:
-		for j in range(0, min_log_length):
-			firstMsg = msgs[0][j]
-			for i in range(1, len(msgs)): # Itera por todos os logs recebidos
-				if firstMsg != msgs[i][j]:
-					unordered = unordered + 1
-					break
-	else:
-		print("Nenhum log de mensagem recebido para comparação.")
-	
-	print ('Encontradas ' + str(unordered) + ' rodadas de mensagens desordenadas')
+	print ('Found ' + str(unordered) + ' unordered message rounds')
 
 
-# Inicia o servidor:
+# Initiate server:
 mainLoop()
-
