@@ -92,6 +92,7 @@ class PeerSystem:
 system = PeerSystem()
 
 def message_handler():
+    global lamport_clock
     print(f"Peer {myself} message handler started")
     
     while system.running:
@@ -177,7 +178,7 @@ def main():
         send_socket.sendto(pickle.dumps(ready_msg), (peer, PEER_UDP_PORT))
     
     # Wait for handshakes
-    while len(system.handshake_received) < N-1 and system.running:
+    while len(system.handshake_received) < N - 1 and system.running:
         time.sleep(0.1)
     
     print(f"Peer {myself} ready with {len(system.handshake_received)} peers")
