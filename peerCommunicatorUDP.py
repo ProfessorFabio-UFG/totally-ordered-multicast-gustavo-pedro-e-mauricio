@@ -129,8 +129,6 @@ class MsgHandler(threading.Thread):
           # Inicializa expected_acks e received_acks para esta mensagem se for a primeira vez que a vemos
           if message_id not in expected_acks:
               # Espera ACKs de todos os outros peers (N-1) para que esta mensagem possa ser entregue localmente em ordem total.
-              # O remetente original da mensagem é responsável por coletar os ACKs.
-              # Aqui, cada peer rastreia a confirmação dos outros.
               expected_acks[message_id] = set(i for i in range(N) if i != sender_id)
               received_acks[message_id] = set()
           
@@ -190,42 +188,43 @@ class MsgHandler(threading.Thread):
     global PEERS
     global myself
 
-    while message_queue:
-      # Use uma cópia do cabeçalho para verificar as condições, remove da fila apenas se estiver pronto
-      next_msg_timestamp, next_msg_sender, next_msg_content = heapq.nsmallest(1, message_queue)[0]
-      message_id = (next_msg_sender, next_msg_content)
+    # Só processa se a fila não estiver vazia
+    if not message_queue:
+        return
 
-      # A mensagem só é entregue se estiver no topo da fila (menor timestamp)
-      # E se todos os ACKs esperados para ela foram recebidos.
-      if message_id in expected_acks:
+    # Verifica a mensagem no topo da fila sem removê-la ainda
+    next_msg_timestamp, next_msg_sender, next_msg_content = heapq.nsmallest(1, message_queue)[0]
+    message_id = (next_msg_sender, next_msg_content)
+
+    # Uma mensagem só pode ser entregue se ela tem entradas em expected_acks
+    # Isso implica que é uma mensagem DATA (ou similar que requer ordem total)
+    if message_id in expected_acks:
         expected_ack_senders = expected_acks[message_id]
         received_ack_senders = received_acks.get(message_id, set())
 
-        # Verifica se o conjunto de ACKs recebidos contém todos os ACKs esperados
-        # (N-1 peers que devem ter enviado ACK para esta mensagem)
+        # Verifica se todos os ACKs esperados foram recebidos
         if expected_ack_senders.issubset(received_ack_senders) and len(expected_ack_senders) == len(received_ack_senders):
-          # Mensagem pronta para ser entregue
-          timestamp, sender, content = heapq.heappop(message_queue)
-          print(f'Mensagem {content} de processo {sender} (clock: {timestamp}) entregue à aplicação. Meu clock: {logical_clock}')
-          self.logList.append((sender, content, timestamp))
-          # Limpa os ACKs relacionados a esta mensagem para evitar crescimento de memória
-          if message_id in expected_acks:
-            del expected_acks[message_id]
-          if message_id in received_acks:
-            del received_acks[message_id]
+            # Mensagem pronta para ser entregue
+            timestamp, sender, content = heapq.heappop(message_queue) # Remove da fila
+            print(f'Mensagem {content} de processo {sender} (clock: {timestamp}) entregue à aplicação. Meu clock: {logical_clock}')
+            self.logList.append((sender, content, timestamp))
+            # Limpa os ACKs relacionados a esta mensagem para evitar crescimento de memória
+            if message_id in expected_acks: # Verifica novamente, pois pode ser removido em outra chamada
+              del expected_acks[message_id]
+            if message_id in received_acks: # Verifica novamente, pois pode ser removido em outra chamada
+              del received_acks[message_id]
+            # Chama recursivamente para verificar se a próxima mensagem na fila pode ser processada
+            self.process_next_message()
         else:
-          # Nem todos os ACKs recebidos, espera e não processa outras mensagens da fila por enquanto
-          return
-      else:
-        # Este caso NÃO DEVERIA MAIS ACONTECER para mensagens DATA ou STOP,
-        # pois expected_acks é agora inicializado para todas as mensagens enfileiradas.
-        # Se acontecer, pode indicar uma falha na lógica de inicialização de expected_acks.
-        # Para fins de depuração, ainda deixamos um log.
-        # Se uma mensagem não está em expected_acks, ela não está aguardando ACKs.
-        # Isso pode ser para mensagens internas ou outros tipos que não exigem total order.
-        timestamp, sender, content = heapq.heappop(message_queue)
-        print(f'Aviso: Mensagem {content} de processo {sender} (clock: {timestamp}) entregue sem rastreamento de ACK (não em expected_acks). Meu clock: {logical_clock}')
-        self.logList.append((sender, content, timestamp))
+            # Nem todos os ACKs recebidos para a mensagem no topo, então nenhuma mensagem pode ser entregue agora.
+            return
+    else:
+        # Este bloco indica uma mensagem no topo da fila que não está sendo rastreada para ACKs.
+        # Para um protocolo de ordenação total, isso não deve acontecer para mensagens DATA.
+        # Se ocorrer, pode indicar um erro na lógica de inicialização de expected_acks ou um tipo de mensagem
+        # que não deveria estar na fila de ordenação total.
+        print(f'ERRO CRÍTICO: Mensagem {next_msg_content} de processo {next_msg_sender} (clock: {next_msg_timestamp}) no topo da fila sem rastreamento de ACK. Isso indica um problema de inicialização. Não entregando. Meu clock: {logical_clock}')
+        return # Não entrega esta mensagem se ela não está sendo rastreada para ACKs
 
 
 # Função para aguardar o sinal de início do servidor de comparação:
