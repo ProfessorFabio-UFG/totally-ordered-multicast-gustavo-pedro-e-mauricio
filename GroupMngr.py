@@ -2,34 +2,29 @@ from socket import *
 import pickle
 from constMP import *
 
+port = GROUPMNGR_TCP_PORT
 membership = []
 
 def serverLoop():
-    serverSock = socket(AF_INET, SOCK_STREAM)
-    serverSock.bind(('0.0.0.0', GROUPMNGR_TCP_PORT))
-    serverSock.listen(5)
-    print(f"Group Manager rodando na porta {GROUPMNGR_TCP_PORT}")
-    
-    while True:
-        conn, addr = serverSock.accept()
-        try:
-            msgPack = conn.recv(2048)
-            req = pickle.loads(msgPack)
-            
-            if req["op"] == "register":
-                membership.append((req["ipaddr"], req["port"]))
-                print(f"Peer registrado: {req['ipaddr']}:{req['port']}")
-                conn.send(pickle.dumps({"status": "ok"}))
-            elif req["op"] == "list":
-                peer_list = [m[0] for m in membership]
-                print(f"Enviando lista de peers: {peer_list}")
-                conn.send(pickle.dumps(peer_list))
-            else:
-                conn.send(pickle.dumps({"error": "Operação desconhecida"}))
-        except Exception as e:
-            print(f"Erro no Group Manager: {e}")
-        finally:
-            conn.close()
+  serverSock = socket(AF_INET, SOCK_STREAM)
+  serverSock.bind(('0.0.0.0', port))
+  serverSock.listen(6)
+  while(1):
+    (conn, addr) = serverSock.accept()
+    msgPack = conn.recv(2048)
+    req = pickle.loads(msgPack)
+    if req["op"] == "register":
+      membership.append((req["ipaddr"],req["port"]))
+      print ('Registered peer: ', req)
+    elif req["op"] == "list":
+      list = []
+      for m in membership:
+        list.append(m[0])
+      print ('List of peers sent to server: ', list)
+      conn.send(pickle.dumps(list))
+    else:
+      pass # fix (send back an answer in case of unknown op
 
-if __name__ == "__main__":
-    serverLoop()
+  conn.close()
+
+serverLoop()
