@@ -10,8 +10,8 @@ handShakeCount = 0
 PEERS = []
 logical_clock = 0
 message_queue = [] # Min-heap para armazenar mensagens com base no seu timestamp
-expected_acks = {} # Dicionário para rastrear os ACKs para mensagens enviadas
-received_acks = {} # Dicionário para armazenar os ACKs recebidos para mensagens enviadas
+expected_acks = {} # Dicionário para rastrear os ACKs para mensagens enviadas por este peer OU recebidas de outros
+received_acks = {} # Dicionário para armazenar os ACKs recebidos para qualquer mensagem rastreada em expected_acks
 messages_to_process = threading.Event()
 myself = -1
 nMsgs = -1
@@ -73,22 +73,20 @@ class MsgHandler(threading.Thread):
     global logical_clock
     global myself
 
+    # Fase 1: Handshake
     while handShakeCount < N - 1: # Aguarda handshakes de N-1 outros pares
       try:
         msgPack = self.sock.recv(1024)
         received_msg = pickle.loads(msgPack)
         
-        # O handshake READY sempre tem 4 elementos: ('READY', myself, logical_clock, my_ip_address)
         if len(received_msg) == 4 and received_msg[0] == 'READY':
             msg_type, sender_numerical_id, msg_timestamp, sender_ip_address = received_msg
             update_logical_clock(msg_timestamp)
             handShakeCount += 1
             print(f'--- Handshake recebido de ID: {sender_numerical_id}, IP: {sender_ip_address}, Clock: {logical_clock}')
-            # Envia ACK de handshake de volta para o endereço IP do remetente
             ack_msg = ('ACK_READY', myself, logical_clock, sender_numerical_id) 
             sendSocket.sendto(pickle.dumps(ack_msg), (sender_ip_address, PEER_UDP_PORT))
         elif len(received_msg) == 4 and received_msg[0] == 'ACK_READY':
-            # Este ACK significa que um handshake enviado por mim foi reconhecido
             msg_type, ack_sender_id, ack_timestamp, original_sender_id = received_msg
             update_logical_clock(ack_timestamp)
             print(f"--- ACK_READY recebido de {ack_sender_id}. Meu clock: {logical_clock}")
@@ -99,6 +97,7 @@ class MsgHandler(threading.Thread):
 
     print('Thread Secundária: Recebeu todos os handshakes. Entrando no loop para receber mensagens.')
 
+    # Fase 2: Troca de Mensagens de Dados e Tratamento de ACK
     stopCount = 0 
     while not self.stop_event.is_set() or stopCount < N:                
       try:
@@ -108,7 +107,6 @@ class MsgHandler(threading.Thread):
         msg_type = received_msg[0]
         
         if msg_type == -1 and len(received_msg) == 5:
-          # Lida com a mensagem de parada: (-1, sender_id, msg_timestamp, None, sender_data_ip_address)
           sender_id, msg_timestamp, content, sender_data_ip_address = received_msg[1:]
           update_logical_clock(msg_timestamp)
           stopCount += 1
@@ -117,21 +115,45 @@ class MsgHandler(threading.Thread):
             self.stop_event.set()
             break
         elif msg_type == 'DATA' and len(received_msg) == 5:
-          # Lida com a mensagem de dados: ('DATA', sender_id, msg_timestamp, content, sender_data_ip_address)
           sender_id, msg_timestamp, content, sender_data_ip_address = received_msg[1:]
           update_logical_clock(msg_timestamp)
+          
+          message_id = (sender_id, content) # O ID da mensagem, independentemente de quem a enviou
           heapq.heappush(message_queue, (msg_timestamp, sender_id, content))
           print(f"Mensagem DATA {content} de {sender_id} (clock: {msg_timestamp}) enfileirada. Meu clock: {logical_clock}")
-          ack_msg = ('ACK', myself, logical_clock, (sender_id, content)) # ACK para a mensagem específica
+          
+          # Envia ACK para o remetente original da mensagem DATA
+          ack_msg = ('ACK', myself, logical_clock, message_id) # ACK para a mensagem específica
           sendSocket.sendto(pickle.dumps(ack_msg), (sender_data_ip_address, PEER_UDP_PORT))
+
+          # Inicializa expected_acks e received_acks para esta mensagem se for a primeira vez que a vemos
+          if message_id not in expected_acks:
+              # Espera ACKs de todos os outros peers (N-1) para que esta mensagem possa ser entregue localmente em ordem total.
+              # O remetente original da mensagem é responsável por coletar os ACKs.
+              # Aqui, cada peer rastreia a confirmação dos outros.
+              expected_acks[message_id] = set(i for i in range(N) if i != sender_id)
+              received_acks[message_id] = set()
+          
+          # Adiciona o próprio ID do peer ao conjunto de ACKs recebidos, pois ele acabou de processar a mensagem
+          # Isso é um reconhecimento local.
+          received_acks[message_id].add(myself)
+          messages_to_process.set() # Sinaliza que pode haver mensagens para processar
+
         elif msg_type == 'ACK' and len(received_msg) == 4:
-          # Lida com a mensagem de ACK: ('ACK', ack_sender_id, ack_timestamp, original_msg_info)
           ack_sender_id, ack_timestamp, original_msg_info = received_msg[1:]
           update_logical_clock(ack_timestamp)
           original_sender, original_content = original_msg_info
-          if (original_sender, original_content) not in received_acks:
-              received_acks[(original_sender, original_content)] = set()
-          received_acks[(original_sender, original_content)].add(ack_sender_id)
+          message_id = (original_sender, original_content)
+
+          # Garante que os dicionários existam para a mensagem que está sendo reconhecida
+          if message_id not in expected_acks:
+              # Isso pode acontecer se recebemos um ACK para uma mensagem que ainda não processamos como DATA.
+              # Nesse caso, assumimos que é uma mensagem que eventualmente será enfileirada e precisa de ACKs de todos.
+              expected_acks[message_id] = set(i for i in range(N) if i != original_sender)
+          
+          if message_id not in received_acks:
+              received_acks[message_id] = set()
+          received_acks[message_id].add(ack_sender_id)
           print(f"ACK para DATA {original_content} de {original_sender} recebido de {ack_sender_id}. Meu clock: {logical_clock}")
           messages_to_process.set() # Sinaliza que pode haver mensagens para processar
         else:
@@ -169,32 +191,40 @@ class MsgHandler(threading.Thread):
     global myself
 
     while message_queue:
+      # Use uma cópia do cabeçalho para verificar as condições, remove da fila apenas se estiver pronto
       next_msg_timestamp, next_msg_sender, next_msg_content = heapq.nsmallest(1, message_queue)[0]
       message_id = (next_msg_sender, next_msg_content)
 
-      # Verifica se todos os ACKs esperados para esta mensagem foram recebidos
+      # A mensagem só é entregue se estiver no topo da fila (menor timestamp)
+      # E se todos os ACKs esperados para ela foram recebidos.
       if message_id in expected_acks:
         expected_ack_senders = expected_acks[message_id]
         received_ack_senders = received_acks.get(message_id, set())
 
+        # Verifica se o conjunto de ACKs recebidos contém todos os ACKs esperados
+        # (N-1 peers que devem ter enviado ACK para esta mensagem)
         if expected_ack_senders.issubset(received_ack_senders) and len(expected_ack_senders) == len(received_ack_senders):
           # Mensagem pronta para ser entregue
           timestamp, sender, content = heapq.heappop(message_queue)
           print(f'Mensagem {content} de processo {sender} (clock: {timestamp}) entregue à aplicação. Meu clock: {logical_clock}')
           self.logList.append((sender, content, timestamp))
-          # Limpa os ACKs relacionados a esta mensagem
+          # Limpa os ACKs relacionados a esta mensagem para evitar crescimento de memória
           if message_id in expected_acks:
             del expected_acks[message_id]
           if message_id in received_acks:
             del received_acks[message_id]
         else:
-          # Nem todos os ACKs recebidos, espera
+          # Nem todos os ACKs recebidos, espera e não processa outras mensagens da fila por enquanto
           return
       else:
-        # Se não houver entrada em expected_acks, significa que é uma mensagem enviada por mim mesmo
-        # (que não requer ACKs de outros) ou um tipo de mensagem que não exige ACKs.
+        # Este caso NÃO DEVERIA MAIS ACONTECER para mensagens DATA ou STOP,
+        # pois expected_acks é agora inicializado para todas as mensagens enfileiradas.
+        # Se acontecer, pode indicar uma falha na lógica de inicialização de expected_acks.
+        # Para fins de depuração, ainda deixamos um log.
+        # Se uma mensagem não está em expected_acks, ela não está aguardando ACKs.
+        # Isso pode ser para mensagens internas ou outros tipos que não exigem total order.
         timestamp, sender, content = heapq.heappop(message_queue)
-        print(f'Mensagem {content} de processo {sender} (clock: {timestamp}) entregue à aplicação (sem ACK esperado). Meu clock: {logical_clock}')
+        print(f'Aviso: Mensagem {content} de processo {sender} (clock: {timestamp}) entregue sem rastreamento de ACK (não em expected_acks). Meu clock: {logical_clock}')
         self.logList.append((sender, content, timestamp))
 
 
@@ -248,16 +278,14 @@ while True:
   for msgNumber in range(0, nMsgs):
     update_logical_clock()
     msg_content = msgNumber
-    message_id = (myself, msg_content)
+    message_id = (myself, msg_content) # ID da mensagem enviada por mim
     
-    # Criar um conjunto de IDs numéricos esperados para ACK
-    expected_ack_ids = set()
-    for i in range(N):
-      if i != myself: # Não espera ACK de si mesmo
-        expected_ack_ids.add(i) # Adiciona o ID numérico do peer
-
-    expected_acks[message_id] = expected_ack_ids
-    received_acks[message_id] = set() # Este set armazenará os IDs numéricos dos peers que enviaram ACK
+    # Inicializa expected_acks e received_acks para a mensagem que estou enviando
+    # Espero ACKs de todos os outros peers (N-1)
+    expected_acks[message_id] = set(i for i in range(N) if i != myself)
+    received_acks[message_id] = set()
+    # Adiciono meu próprio ID como "ACK" local de que processei esta mensagem enviada por mim
+    received_acks[message_id].add(myself)
 
     # A mensagem DATA agora inclui o IP do remetente para que o receptor saiba para onde enviar o ACK
     msg = ('DATA', myself, logical_clock, msg_content, my_ip_address)
