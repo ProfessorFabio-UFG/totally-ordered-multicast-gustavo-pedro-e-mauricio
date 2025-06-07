@@ -7,13 +7,13 @@ import pickle
 from requests import get
 from collections import deque
 
-# Estruturas de dados
+# Variáveis globais
 logical_clock = 0
 message_queue = deque()
 pending_acks = {}
 PEERS = []
 handShakeCount = 0
-myself = None  # Será definido quando recebermos o sinal de início
+myself = None
 
 # Sockets
 sendSocket = socket(AF_INET, SOCK_DGRAM)
@@ -82,6 +82,16 @@ def deliver_message(msg_type, msg_id, msg_clock, sender_id, sender_addr=None):
     elif msg_type == 'ACK':
         print(f'ACK received for message {msg_id} from process {sender_id}')
 
+def waitToStart():
+    (conn, addr) = serverSock.accept()
+    msg = pickle.loads(conn.recv(1024))
+    global myself
+    myself = msg[0]
+    nMsgs = msg[1]
+    conn.send(pickle.dumps(f'Peer process {myself} started.'))
+    conn.close()
+    return (myself, nMsgs)
+
 class MsgHandler(threading.Thread):
     def __init__(self, sock):
         threading.Thread.__init__(self)
@@ -136,49 +146,50 @@ class MsgHandler(threading.Thread):
         clientSock.send(pickle.dumps(list(message_queue)))
         clientSock.close()
 
-# Inicialização
-registerWithGroupManager()
-(myself, nMsgs) = waitToStart()
-print(f'I am up, and my ID is: {myself}')
+# Main execution
+if __name__ == "__main__":
+    registerWithGroupManager()
+    (myself, nMsgs) = waitToStart()
+    print(f'I am up, and my ID is: {myself}')
 
-if nMsgs == 0:
-    exit(0)
+    if nMsgs == 0:
+        exit(0)
 
-# Inicia thread para processar fila de mensagens
-queue_processor = threading.Thread(target=process_message_queue)
-queue_processor.daemon = True
-queue_processor.start()
+    # Inicia thread para processar fila de mensagens
+    queue_processor = threading.Thread(target=process_message_queue)
+    queue_processor.daemon = True
+    queue_processor.start()
 
-# Inicia handler de mensagens
-msgHandler = MsgHandler(recvSocket)
-msgHandler.start()
+    # Inicia handler de mensagens
+    msgHandler = MsgHandler(recvSocket)
+    msgHandler.start()
 
-PEERS = getListOfPeers()
+    PEERS = getListOfPeers()
 
-# Envia handshakes
-my_ip = get_public_ip()
-for peer in PEERS:
-    if peer != my_ip:  # Não enviar handshake para si mesmo
-        msg = ('READY', myself, logical_clock, peer)
-        sendSocket.sendto(pickle.dumps(msg), (peer, PEER_UDP_PORT))
-
-while handShakeCount < N-1:  # N-1 porque não contamos conosco mesmos
-    time.sleep(0.1)
-
-# Envia mensagens de dados
-for msgNumber in range(nMsgs):
-    logical_clock += 1
-    msg = ('DATA', msgNumber, logical_clock, myself, my_ip)
+    # Envia handshakes
+    my_ip = get_public_ip()
     for peer in PEERS:
-        if peer != my_ip:  # Não enviar mensagem para si mesmo
+        if peer != my_ip:  # Não enviar handshake para si mesmo
+            msg = ('READY', myself, logical_clock, peer)
             sendSocket.sendto(pickle.dumps(msg), (peer, PEER_UDP_PORT))
-            pending_acks[(peer, msgNumber)] = False
-            print(f'Sent message {msgNumber} to {peer}')
 
-# Envia mensagens de término
-for peer in PEERS:
-    if peer != my_ip:
-        msg = (-1, -1)
-        sendSocket.sendto(pickle.dumps(msg), (peer, PEER_UDP_PORT))
+    while handShakeCount < N-1:  # N-1 porque não contamos conosco mesmos
+        time.sleep(0.1)
 
-msgHandler.join()
+    # Envia mensagens de dados
+    for msgNumber in range(nMsgs):
+        logical_clock += 1
+        msg = ('DATA', msgNumber, logical_clock, myself, my_ip)
+        for peer in PEERS:
+            if peer != my_ip:  # Não enviar mensagem para si mesmo
+                sendSocket.sendto(pickle.dumps(msg), (peer, PEER_UDP_PORT))
+                pending_acks[(peer, msgNumber)] = False
+                print(f'Sent message {msgNumber} to {peer}')
+
+    # Envia mensagens de término
+    for peer in PEERS:
+        if peer != my_ip:
+            msg = (-1, -1)
+            sendSocket.sendto(pickle.dumps(msg), (peer, PEER_UDP_PORT))
+
+    msgHandler.join()
